@@ -592,6 +592,9 @@ class MANAGED ArtMethod FINAL : public Object {
         (sizeof(PtrSizedFields) / sizeof(void*)) * pointer_size;
   }
 
+  static jclass xposed_callback_class;
+  static jmethodID xposed_callback_method;
+
  protected:
   // Field order required by test "ValidateFieldOrderOfJavaCppUnionClasses".
   // The class we are a part of.
