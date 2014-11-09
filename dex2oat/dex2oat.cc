@@ -70,6 +70,8 @@ namespace art {
 
 static int original_argc;
 static char** original_argv;
+static uint32_t original_oat_checksum = 0;
+static bool is_recompiling = false;
 
 static std::string CommandLine() {
   std::vector<std::string> command;
@@ -270,6 +272,7 @@ class Dex2Oat {
 
   ~Dex2Oat() {
     delete runtime_;
+    LogCompletionTime();
   }
 
   void LogCompletionTime(const CompilerDriver* compiler) {
@@ -504,6 +507,10 @@ class Dex2Oat {
     return true;
   }
 
+  void SetRuntimeRecompiling(bool new_value) {
+    runtime_->SetRecompiling(true);
+  }
+
  private:
   explicit Dex2Oat(const CompilerOptions* compiler_options,
                    Compiler::Kind compiler_kind,
@@ -604,7 +611,27 @@ static size_t OpenDexFiles(const std::vector<const char*>& dex_filenames,
       LOG(WARNING) << "Skipping non-existent dex file '" << dex_filename << "'";
       continue;
     }
-    if (!DexFile::Open(dex_filename, dex_location, &error_msg, &dex_files)) {
+    if (EndsWith(dex_filename, ".oat") || EndsWith(dex_filename, ".odex")) {
+        const OatFile* oat_file = OatFile::Open(dex_filename, dex_location, nullptr, false, &error_msg);
+      if (oat_file == nullptr) {
+        LOG(WARNING) << "Failed to open oat file from '" << dex_filename << "': " << error_msg;
+        ++failure_count;
+      } else {
+        for (const OatFile::OatDexFile* oat_dex_file : oat_file->GetOatDexFiles()) {
+          CHECK(oat_dex_file != nullptr);
+          std::unique_ptr<const DexFile> dex_file(oat_dex_file->OpenDexFile(&error_msg));
+          if (dex_file.get() != nullptr) {
+            dex_files.push_back(dex_file.release());
+          } else {
+            LOG(WARNING) << "Failed to open dex file '" << oat_dex_file->GetDexFileLocation()
+                << "' from file '" << dex_filename << "': " << error_msg;
+            ++failure_count;
+          }
+        }
+      }
+      is_recompiling = true;
+      original_oat_checksum = oat_file->GetOatHeader().GetChecksum();
+    } else if (!DexFile::Open(dex_filename, dex_location, &error_msg, &dex_files)) {
       LOG(WARNING) << "Failed to open .dex from file '" << dex_filename << "': " << error_msg;
       ++failure_count;
     }
@@ -680,15 +707,23 @@ class WatchDog {
             message.c_str());
   }
 
+  static void Warn(const std::string& message) {
+    Message('W', message);
+  }
+
   static void Fatal(const std::string& message) {
     Message('F', message);
     exit(1);
   }
 
   void Wait() {
+    bool warning = true;
+    CHECK_GT(kWatchDogTimeoutSeconds, kWatchDogWarningSeconds);
     // TODO: tune the multiplier for GC verification, the following is just to make the timeout
     //       large.
     int64_t multiplier = kVerifyObjectSupport > kVerifyObjectModeFast ? 100 : 1;
+    timespec warning_ts;
+    InitTimeSpec(true, CLOCK_REALTIME, multiplier * kWatchDogWarningSeconds * 1000, 0, &warning_ts);
     timespec timeout_ts;
     InitTimeSpec(true, CLOCK_REALTIME, multiplier * kWatchDogTimeoutSeconds * 1000, 0, &timeout_ts);
     const char* reason = "dex2oat watch dog thread waiting";
@@ -710,9 +745,13 @@ class WatchDog {
   // Debug builds are slower so they have larger timeouts.
   static const unsigned int kSlowdownFactor = kIsDebugBuild ? 5U : 1U;
 #if ART_USE_PORTABLE_COMPILER
+  // 2 minutes scaled by kSlowdownFactor.
+  static const unsigned int kWatchDogWarningSeconds = kSlowdownFactor * 2 * 60;
   // 30 minutes scaled by kSlowdownFactor.
   static const unsigned int kWatchDogTimeoutSeconds = kSlowdownFactor * 30 * 60;
 #else
+  // 1 minutes scaled by kSlowdownFactor.
+  static const unsigned int kWatchDogWarningSeconds = kSlowdownFactor * 1 * 60;
   // 6 minutes scaled by kSlowdownFactor.
   static const unsigned int kWatchDogTimeoutSeconds = kSlowdownFactor * 6 * 60;
 #endif
@@ -725,6 +764,7 @@ class WatchDog {
   pthread_attr_t attr_;
   pthread_t pthread_;
 };
+const unsigned int WatchDog::kWatchDogWarningSeconds;
 const unsigned int WatchDog::kWatchDogTimeoutSeconds;
 
 // Given a set of instruction features from the build, parse it.  The
@@ -791,7 +831,7 @@ void ParseDouble(const std::string& option, char after_char,
   *parsed_value = value;
 }
 
-static void b13564922() {
+static int dex2oat(int argc, char** argv) {
 #if defined(__linux__) && defined(__arm__)
   int major, minor;
   struct utsname uts;
@@ -853,6 +893,7 @@ static int dex2oat(int argc, char** argv) {
   std::vector<const char*> dex_locations;
   int zip_fd = -1;
   std::string zip_location;
+  std::string odex_filename;
   std::string oat_filename;
   std::string oat_symbols;
   std::string oat_location;
@@ -1377,6 +1418,10 @@ static int dex2oat(int argc, char** argv) {
   }
   std::unique_ptr<Dex2Oat> dex2oat(p_dex2oat);
 
+  if (is_recompiling) {
+    dex2oat->SetRuntimeRecompiling(true);
+  }
+
   // Runtime::Create acquired the mutator_lock_ that is normally given away when we Runtime::Start,
   // give it away now so that we don't starve GC.
   Thread* self = Thread::Current();
@@ -1436,6 +1481,16 @@ static int dex2oat(int argc, char** argv) {
     dex_files = Runtime::Current()->GetClassLinker()->GetBootClassPath();
   } else {
     if (dex_filenames.empty()) {
+      odex_filename = DexFilenameToOdexFilename(zip_location, instruction_set);
+      if (OS::FileExists(odex_filename.c_str())) {
+        LOG(INFO) << "Using '" << odex_filename << "' instead of file descriptor";
+        dex_filenames.push_back(odex_filename.data());
+        dex_locations.push_back(odex_filename.data());
+        is_recompiling = true;
+        dex2oat->SetRuntimeRecompiling(true);
+      }
+    }
+    if (dex_filenames.empty()) {
       ATRACE_BEGIN("Opening zip archive from file descriptor");
       std::string error_msg;
       std::unique_ptr<ZipArchive> zip_archive(ZipArchive::OpenFromFd(zip_fd, zip_location.c_str(),
@@ -1463,6 +1518,9 @@ static int dex2oat(int argc, char** argv) {
         oat_file->Erase();
         return EXIT_FAILURE;
       }
+      if (is_recompiling) {
+        dex2oat->SetRuntimeRecompiling(true);
+      }
     }
 
     const bool kSaveDexInput = false;
@@ -1486,7 +1544,7 @@ static int dex2oat(int argc, char** argv) {
   }
   // Ensure opened dex files are writable for dex-to-dex transformations.
   for (const auto& dex_file : dex_files) {
-    if (!dex_file->EnableWrite()) {
+    if (!is_recompiling && !dex_file->EnableWrite()) {
       PLOG(ERROR) << "Failed to make .dex file writeable '" << dex_file->GetLocation() << "'\n";
     }
   }
@@ -1536,6 +1594,13 @@ static int dex2oat(int argc, char** argv) {
     oss << kRuntimeISA;
     key_value_store->Put(OatHeader::kDex2OatHostKey, oss.str());
     key_value_store->Put(OatHeader::kPicKey, compile_pic ? "true" : "false");
+  }
+  key_value_store->Put(OatHeader::kDex2OatCmdLineKey, oss.str());
+  oss.str("");  // Reset.
+  oss << kRuntimeISA;
+  key_value_store->Put(OatHeader::kDex2OatHostKey, oss.str());
+  if (image && original_oat_checksum != 0) {
+    key_value_store->Put(OatHeader::kOriginalOatChecksumKey, StringPrintf("0x%08x", original_oat_checksum));
   }
 
   std::unique_ptr<const CompilerDriver> compiler(dex2oat->CreateOatFile(boot_image_option,
