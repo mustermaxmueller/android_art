@@ -37,6 +37,12 @@ class ScopedObjectAccessAlreadyRunnable;
 class StringPiece;
 class ShadowFrame;
 
+struct XposedHookInfo {
+  jobject reflectedMethod;
+  jobject additionalInfo;
+  mirror::ArtMethod* originalMethod;
+};
+
 namespace mirror {
 
 typedef void (EntryPointFromInterpreter)(Thread* self, MethodHelper& mh,
@@ -49,6 +55,11 @@ class MANAGED ArtMethod FINAL : public Object {
  public:
   // Size of java.lang.reflect.ArtMethod.class.
   static uint32_t ClassSize();
+
+  // Size of an instance of java.lang.reflect.ArtMethod not including its value array.
+  static constexpr uint32_t InstanceSize() {
+    return sizeof(ArtMethod);
+  }
 
   static ArtMethod* FromReflectedMethod(const ScopedObjectAccessAlreadyRunnable& soa,
                                         jobject jlr_method)
@@ -201,6 +212,14 @@ class MANAGED ArtMethod FINAL : public Object {
     SetField32<false>(OFFSET_OF_OBJECT_MEMBER(ArtMethod, dex_method_index_), new_idx);
   }
 
+  ObjectArray<String>* GetDexCacheStrings() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void SetDexCacheStrings(ObjectArray<String>* new_dex_cache_strings)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  static MemberOffset DexCacheStringsOffset() {
+    return OFFSET_OF_OBJECT_MEMBER(ArtMethod, dex_cache_strings_);
+  }
+
   static MemberOffset DexCacheResolvedMethodsOffset() {
     return OFFSET_OF_OBJECT_MEMBER(ArtMethod, dex_cache_resolved_methods_);
   }
@@ -326,6 +345,9 @@ class MANAGED ArtMethod FINAL : public Object {
     SetFieldPtrWithSize<false, true, kVerifyFlags>(
         EntryPointFromQuickCompiledCodeOffset(pointer_size), entry_point_from_quick_compiled_code,
         pointer_size);
+    DCHECK(!IsXposedHookedMethod());
+    SetFieldPtr<false, true, kVerifyFlags>(
+        EntryPointFromQuickCompiledCodeOffset(), entry_point_from_quick_compiled_code);
   }
 
   uint32_t GetCodeSize() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -549,8 +571,21 @@ class MANAGED ArtMethod FINAL : public Object {
     total += pointer_size - sizeof(uint32_t);
 #endif
     return total;
+  // Xposed
+  bool IsXposedHookedMethod() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    return (GetAccessFlags() & kAccXposedHookedMethod) != 0;
   }
 
+  bool IsXposedOriginalMethod() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+      return (GetAccessFlags() & kAccXposedOriginalMethod) != 0;
+  }
+
+  XposedHookInfo* GetXposedHookInfo() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    return (XposedHookInfo*) GetNativeMethod();
+  }
+
+  ArtMethod* GetXposedOriginalMethod() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    return GetXposedHookInfo()->originalMethod;
   // Size of an instance of java.lang.reflect.ArtMethod not including its value array.
   static size_t InstanceSize(size_t pointer_size) {
     return SizeWithoutPointerFields(pointer_size) +
