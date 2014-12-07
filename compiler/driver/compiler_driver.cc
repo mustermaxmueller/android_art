@@ -430,8 +430,21 @@ CompilerDriver::~CompilerDriver() {
   {
     MutexLock mu(self, compiled_classes_lock_);
     STLDeleteValues(&compiled_classes_);
+  }
+  {
+    MutexLock mu(self, compiled_methods_lock_);
+    STLDeleteValues(&compiled_methods_);
+  }
+  {
+    MutexLock mu(self, compiled_methods_lock_);
     STLDeleteElements(&code_to_patch_);
+  }
+  {
+    MutexLock mu(self, compiled_methods_lock_);
     STLDeleteElements(&methods_to_patch_);
+  }
+  {
+    MutexLock mu(self, compiled_methods_lock_);
     STLDeleteElements(&classes_to_patch_);
     STLDeleteElements(&strings_to_patch_);
 
